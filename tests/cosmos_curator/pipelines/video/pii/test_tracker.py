@@ -77,12 +77,12 @@ def _painted(results: list[FrameResult]) -> list[int]:
 
 
 def test_detector_looks_on_frames_0_5_10() -> None:
-    """The detector runs on every 5th frame and on no other."""
+    """The detector runs on every 5th frame, and on the last frame when that is not already a look."""
     detector = ScriptedDetector({})
 
     _run(detector, _static_frames(18, center=None))
 
-    assert detector.calls == [0, 5, 10, 15]
+    assert detector.calls == [0, 5, 10, 15, 17]
 
 
 def test_every_frame_comes_back_once_in_order() -> None:
@@ -136,6 +136,27 @@ def test_first_two_looks_are_exempt_from_the_wait() -> None:
 
         assert tracker.stats.tracks_confirmed == 1, only_look_frame
         assert only_look_frame in _painted(results)
+
+
+def test_the_last_frame_is_a_look_when_it_is_not_already_one() -> None:
+    """A face that enters after the final scheduled look is detected, blurred, and painted backward."""
+    detector = ScriptedDetector({7: [face(FACE)]})
+
+    results, tracker, _ = _run(detector, _static_frames(8))
+
+    assert detector.calls == [0, 5, 7]
+    assert tracker.stats.tracks_confirmed == 1
+    # The clip is shorter than the hold, so the closing look paints the whole clip.
+    assert _painted(results) == list(range(8))
+
+
+def test_the_last_frame_is_not_looked_at_twice() -> None:
+    """A clip that already ends on a look does not detect that frame again."""
+    detector = ScriptedDetector({})
+
+    _run(detector, _static_frames(16, center=None))
+
+    assert detector.calls == [0, 5, 10, 15]
 
 
 def test_look_two_is_not_exempt() -> None:

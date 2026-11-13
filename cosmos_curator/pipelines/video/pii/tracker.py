@@ -17,15 +17,18 @@
 
 Frames are pushed in order. Every ``look_interval``-th frame is a *look*: the
 detector runs on it. The frames in between *follow* the masks found on the last
-look. Frames are held for ``hold_frames`` before they are released, because a
-face found late is painted back onto the frames still held.
+look. The last frame of a clip is also a look when it was not already one, so a
+face that enters in the tail is still found. Frames are held for ``hold_frames``
+before they are released, because a face found late is painted back onto the
+frames still held.
 
 The rules, all copied from MicroAGI's published behaviour:
 
 * A detection joins the existing face it overlaps most (highest overlap first).
   The first label a face gets sticks.
 * A new face is only blurred once a second look finds it, except on the first
-  two looks of a clip. A face seen once and then missed is never blurred.
+  two looks of a clip and on the closing look. A face seen once and then missed
+  is never blurred.
 * A confirmed face that a look misses keeps its identity and its mask grows.
   After ``max_missed_looks`` misses in a row it is dropped.
 * A new face is painted backward onto the held frames before it was found.
@@ -162,7 +165,17 @@ class PiiTracker:
         return self._release(keep_from=index - self._config.hold_frames)
 
     def finish(self) -> list[FrameResult]:
-        """End of clip: release every frame still held. Faces seen only once stay unblurred."""
+        """End of clip. Look at the last frame if it was not already a look, then release everything.
+
+        A face found only on that closing look is blurred at once and painted
+        backward through the hold. There is no later look that could confirm it.
+        A face seen once on an earlier look and missed since then still stays
+        unblurred.
+        """
+        if self._buffer:
+            last = self._buffer[-1]
+            if last.index % self._config.look_interval != 0:
+                self._look(last, confirm_new=True)
         return self._release(keep_from=None)
 
     # -------------------------------------------------------------- per frame
@@ -175,8 +188,12 @@ class PiiTracker:
                 track, slot, fallback=previous.regions[track.track_id].mask, missed_looks=track.missed_looks
             )
 
-    def _look(self, slot: _Slot) -> None:
-        """Run the detector on a look frame, then match, confirm, miss, drop and create faces."""
+    def _look(self, slot: _Slot, *, confirm_new: bool = False) -> None:
+        """Run the detector on a look frame, then match, confirm, miss, drop and create faces.
+
+        ``confirm_new`` blurs a face that is first seen on this look, without
+        waiting for another. The closing look of a clip sets it.
+        """
         cfg = self._config
         self.stats.looks += 1
         look_number = self.stats.looks - 1
@@ -218,7 +235,7 @@ class PiiTracker:
 
         for det_index, detection in enumerate(detections):
             if det_index not in matches:
-                self._create(detection, slot, exempt=look_number < cfg.first_looks_exempt)
+                self._create(detection, slot, exempt=confirm_new or look_number < cfg.first_looks_exempt)
 
     def _match(self, detections: Sequence[Detection], projected: dict[int, Region]) -> dict[int, int]:
         """Greedy match, highest overlap first. Returns ``{detection index: track id}``."""

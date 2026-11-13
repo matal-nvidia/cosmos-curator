@@ -192,7 +192,7 @@ def test_the_clip_is_decoded_once(monkeypatch: pytest.MonkeyPatch) -> None:
     redact_mp4(mp4, detector, _config())
 
     assert calls["frames"] == 1
-    assert detector.calls == [0, 5, 10, 15, 20, 25]
+    assert detector.calls == [0, 5, 10, 15, 20, 25, 29]
 
 
 def test_a_decode_window_does_not_change_the_output() -> None:
