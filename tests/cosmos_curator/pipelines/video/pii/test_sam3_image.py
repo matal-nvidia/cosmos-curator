@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 import torch
 
+from cosmos_curator.pipelines.video.pii import sam3_image
 from cosmos_curator.pipelines.video.pii.sam3_image import (
     INPUT_SIZE,
     Sam3ImageDetector,
@@ -127,6 +128,25 @@ def test_the_image_is_encoded_once_per_frame_and_the_prompts_once_per_run() -> N
     assert model.forwards == ["1", "2", "1", "2"]
     assert processor.image_sizes == [(_SIZE, _SIZE), (_SIZE, _SIZE)]
     assert processor.requested_size == [{"height": _SIZE, "width": _SIZE}] * 2
+
+
+def test_a_mask_under_the_cutoff_is_never_copied_off_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """0.50 is copied and returned. 0.49 is dropped before its mask is copied."""
+    copied: list[object] = []
+    real_as_mask = sam3_image._as_mask
+
+    def counting_as_mask(mask: object) -> np.ndarray:
+        copied.append(mask)
+        return real_as_mask(mask)
+
+    monkeypatch.setattr(sam3_image, "_as_mask", counting_as_mask)
+    segmenter = Sam3ImageSegmenter(_Model(), _Processor({"human face": 1, "head": 2}), input_size=_SIZE)
+    segmenter.prepare(["human face", "head"])
+
+    found = segmenter.segment(np.zeros((_SIZE, _SIZE, 3), dtype=np.uint8), min_score=0.50)
+
+    assert [(score, prompt) for _, score, prompt in found] == [(pytest.approx(0.50), "human face")]
+    assert len(copied) == 1
 
 
 def test_detect_rejects_a_score_under_the_cutoff_and_keeps_the_cutoff() -> None:

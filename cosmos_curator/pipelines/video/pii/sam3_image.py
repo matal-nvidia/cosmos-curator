@@ -66,8 +66,10 @@ class _Segmenter(Protocol):
         """Cache one text embedding per prompt."""
         ...
 
-    def segment(self, square_rgb: npt.NDArray[np.uint8]) -> list[tuple[npt.NDArray[np.bool_], float, str]]:
-        """Return ``(mask, score, prompt)`` for ``square_rgb``, masks at the square's size."""
+    def segment(
+        self, square_rgb: npt.NDArray[np.uint8], min_score: float = 0.0
+    ) -> list[tuple[npt.NDArray[np.bool_], float, str]]:
+        """Return ``(mask, score, prompt)`` at or above ``min_score``, masks at the square's size."""
         ...
 
 
@@ -75,14 +77,24 @@ class Sam3ImageSegmenter:
     """Runs ``facebook/sam3`` as a still-image model.
 
     Text embeddings are cached by :meth:`prepare`. :meth:`segment` encodes the
-    image once and asks each cached prompt in turn.
+    image once and asks each cached prompt in turn. The two forward passes run
+    under bf16 autocast unless ``bf16`` is off. The weights stay fp32, and the
+    outputs are cast back to fp32 before masks are cut.
     """
 
-    def __init__(self, model: Any, processor: Any, input_size: int = INPUT_SIZE) -> None:  # noqa: ANN401
+    def __init__(
+        self,
+        model: Any,  # noqa: ANN401
+        processor: Any,  # noqa: ANN401
+        input_size: int = INPUT_SIZE,
+        *,
+        bf16: bool = True,
+    ) -> None:
         """Wrap an already loaded ``Sam3Model`` and ``Sam3Processor``."""
         self._model = model
         self._processor = processor
         self._input_size = input_size
+        self._bf16 = bf16
         self._device = model.device
         # (prompt, text-encoder output, attention mask). The model reads
         # ``.pooler_output`` off the text output, so the whole output is kept.
@@ -103,8 +115,15 @@ class Sam3ImageSegmenter:
             cached.append((prompt, text, tokens["attention_mask"]))
         self._prompts = cached
 
-    def segment(self, square_rgb: npt.NDArray[np.uint8]) -> list[tuple[npt.NDArray[np.bool_], float, str]]:
-        """Encode ``square_rgb`` once and ask every prepared prompt."""
+    def segment(
+        self, square_rgb: npt.NDArray[np.uint8], min_score: float = 0.0
+    ) -> list[tuple[npt.NDArray[np.bool_], float, str]]:
+        """Encode ``square_rgb`` once and ask every prepared prompt.
+
+        Only masks scoring at least ``min_score`` leave the GPU. Each look returns
+        200 candidate masks as ``int64``, so copying all of them costs more than
+        the forward pass.
+        """
         import torch  # noqa: PLC0415 -- the package imports without torch installed
 
         if not self._prompts:
@@ -118,15 +137,17 @@ class Sam3ImageSegmenter:
             ),
             self._device,
         )
-        with torch.no_grad():
+        autocast = torch.autocast(device_type=torch.device(self._device).type, dtype=torch.bfloat16, enabled=self._bf16)
+        with torch.inference_mode(), autocast:
             vision = self._model.get_vision_features(pixel_values=image["pixel_values"])
         found: list[tuple[npt.NDArray[np.bool_], float, str]] = []
         target = [(self._input_size, self._input_size)]
         for prompt, text, attention_mask in self._prompts:
-            with torch.no_grad():
+            with torch.inference_mode(), autocast:
                 outputs = self._model(vision_embeds=vision, text_embeds=text, attention_mask=attention_mask)
+            _outputs_to_fp32(outputs)
             # threshold 0: the library keeps scores *strictly above* its threshold,
-            # and the plan says at least 0.50. The detector applies that comparison.
+            # and the plan says at least 0.50. ``min_score`` applies that comparison.
             result = self._processor.post_process_instance_segmentation(
                 outputs,
                 threshold=0.0,
@@ -134,7 +155,9 @@ class Sam3ImageSegmenter:
                 target_sizes=target,
             )[0]
             for mask, score in zip(result["masks"], result["scores"], strict=True):
-                found.append((_as_mask(mask), float(score), prompt))
+                value = float(score)
+                if value >= min_score:
+                    found.append((_as_mask(mask), value, prompt))
         return found
 
 
@@ -188,7 +211,7 @@ class Sam3ImageDetector:
         height, width = frame_rgb.shape[:2]
         square = stretch_to_square(frame_rgb, self._input_size)
         detections: list[Detection] = []
-        for mask, score, label in self._segmenter.segment(square):
+        for mask, score, label in self._segmenter.segment(square, self._score_threshold):
             if score < self._score_threshold:
                 continue
             full = mask_to_frame(mask, height, width)
@@ -226,6 +249,13 @@ def load_sam3_image_segmenter(input_size: int = INPUT_SIZE, model_dir: Path | No
     model = cast("Any", Sam3Model.from_pretrained(model_dir, local_files_only=True)).to("cuda")
     model.eval()
     return Sam3ImageSegmenter(model, processor, input_size)
+
+
+def _outputs_to_fp32(outputs: Any) -> None:  # noqa: ANN401
+    for name in ("pred_masks", "pred_logits", "pred_boxes", "presence_logits"):
+        value = getattr(outputs, name, None)
+        if value is not None and value.is_floating_point():
+            setattr(outputs, name, value.float())
 
 
 def _to_device(batch: Any, device: Any) -> Any:  # noqa: ANN401
