@@ -466,6 +466,9 @@ class Clip:
     intern_video_2_text_match: tuple[str, float] | None = None
     # for debugging
     errors: dict[str, str] = attrs.Factory(dict)
+    # Compressed mask archive from PII redaction in ``none`` mode. The clip writer
+    # does not upload this yet.
+    pii_mask_archive: bytes | None = None
     # Qwen video classifier: list of VIDEO_TYPE_LABELS that were "yes" in any window (for metadata/debug)
     qwen_type_classification: list[str] | None = None
     # When clip is in filtered_clips due to Qwen: "classifier" (type allow/block) or "semantic" (criteria filter)

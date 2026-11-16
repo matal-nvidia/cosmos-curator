@@ -28,6 +28,7 @@ from cosmos_curator.pipelines.video.captioning.caption_quality_flags import (
     CaptionQualityThresholdConfig,
 )
 from cosmos_curator.pipelines.video.captioning.captioning_builders import CaptioningConfig, VllmAsyncCaptionConfig
+from cosmos_curator.pipelines.video.clipping.clip_extraction_stages import ClipTranscodingStage
 from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import ClipFrameExtractionStage
 from cosmos_curator.pipelines.video.embedding.embedding_builders import (
     CosmosEmbed1Config,
@@ -36,6 +37,7 @@ from cosmos_curator.pipelines.video.embedding.embedding_builders import (
     InternVideo2Config,
     OpenAIEmbeddingConfig,
 )
+from cosmos_curator.pipelines.video.pii.stage import PiiRedactionStage
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
 from cosmos_curator.pipelines.video.splitting_pipeline import _assemble_stages, _setup_parser
 from cosmos_curator.pipelines.video.utils.data_model import (
@@ -80,6 +82,54 @@ def _caption_args(extra_args: list[str]) -> argparse.Namespace:
             *extra_args,
         ]
     )
+
+
+_PII_NUMBERS = [
+    "--pii-redaction",
+    "--pii-mask-growth",
+    "1.25",
+    "--pii-missed-look-growth",
+    "1.0",
+    "--pii-blur-kernel",
+    "31",
+]
+
+
+def test_pii_redaction_is_off_unless_asked() -> None:
+    """The default split list has no redaction stage."""
+    stages = [stage_object(stage) for stage in _assemble_stages(_caption_args([]))]
+
+    assert not any(isinstance(stage, PiiRedactionStage) for stage in stages)
+
+
+def test_pii_redaction_sits_after_transcode_and_before_frame_extraction() -> None:
+    """When asked, the stage follows transcode and precedes frame extraction."""
+    stages = [
+        stage_object(stage)
+        for stage in _assemble_stages(_caption_args([*_PII_NUMBERS, "--aesthetic-threshold", "3.5"]))
+    ]
+    names = [type(stage).__name__ for stage in stages]
+
+    assert names.index("PiiRedactionStage") == names.index("ClipTranscodingStage") + 1
+    assert names.index("PiiRedactionStage") < names.index("ClipFrameExtractionStage")
+    assert isinstance(stages[names.index("PiiRedactionStage")], PiiRedactionStage)
+    assert isinstance(stages[names.index("ClipTranscodingStage")], ClipTranscodingStage)
+
+
+def test_pii_redaction_uses_the_trial_defaults() -> None:
+    """The flag alone uses growth 1.25, missed-look growth 1.5, and kernel 151."""
+    stages = [stage_object(stage) for stage in _assemble_stages(_caption_args(["--pii-redaction"]))]
+    stage = next(stage for stage in stages if isinstance(stage, PiiRedactionStage))
+
+    assert stage._config.mask_growth == 1.25
+    assert stage._config.missed_look_growth == 1.5
+    assert stage._config.blur_kernel == 151
+
+
+def test_pii_redaction_refuses_fixed_stride() -> None:
+    """Fixed-stride clips can contain a scene cut, and v0 does not handle cuts."""
+    with pytest.raises(ValueError, match="fixed-stride"):
+        _assemble_stages(_caption_args([*_PII_NUMBERS, "--splitting-algorithm", "fixed-stride"]))
 
 
 def _embedding_args(extra_args: list[str]) -> argparse.Namespace:

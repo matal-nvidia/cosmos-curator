@@ -119,6 +119,14 @@ from cosmos_curator.pipelines.video.filtering.motion.motion_builders import (
     MotionFilterConfig,
     build_motion_filter_stages,
 )
+from cosmos_curator.pipelines.video.pii.builders import (
+    DEFAULT_BLUR_KERNEL,
+    DEFAULT_MASK_GROWTH,
+    DEFAULT_MISSED_LOOK_GROWTH,
+    PiiRedactionStageConfig,
+    build_pii_redaction_stages,
+)
+from cosmos_curator.pipelines.video.pii.config import PaintMode
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import (
     ClipWriterStage,
     consolidate_lance_fragments,
@@ -549,6 +557,30 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
     )
+
+    # --- PII redaction (optional) ---
+    # After transcode, before frame extraction, so later stages read the blurred clip.
+    # Fixed-stride clips can contain a scene cut, and v0 does not handle cuts.
+    if args.pii_redaction:
+        if args.splitting_algorithm == "fixed-stride":
+            msg = (
+                "PII redaction only runs on clips with no scene cut. "
+                "fixed-stride clips can contain one. Use --splitting-algorithm transnetv2."
+            )
+            raise ValueError(msg)
+        paint_mode = PaintMode(args.pii_paint_mode)
+        stages.extend(
+            build_pii_redaction_stages(
+                PiiRedactionStageConfig(
+                    mask_growth=args.pii_mask_growth,
+                    missed_look_growth=args.pii_missed_look_growth,
+                    blur_kernel=args.pii_blur_kernel,
+                    paint_mode=paint_mode,
+                    gpus_per_worker=args.pii_gpus_per_worker,
+                    verbose=args.verbose,
+                )
+            )
+        )
 
     # --- Super-resolution (optional) ---
     if args.super_resolution:
@@ -1583,6 +1615,47 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=int,
         default=32,
         help="Number of clips per chunk after transcoding stage.",
+    )
+    # --- PII redaction args ---
+    parser.add_argument(
+        "--pii-redaction",
+        action="store_true",
+        default=False,
+        help="Blur faces in each clip after transcoding. Off unless this flag is set.",
+    )
+    parser.add_argument(
+        "--pii-mask-growth",
+        type=float,
+        default=DEFAULT_MASK_GROWTH,
+        help=(
+            "Scale applied to a face mask about its centroid. "
+            f"Default {DEFAULT_MASK_GROWTH}. 1.0 means no growth."
+        ),
+    )
+    parser.add_argument(
+        "--pii-missed-look-growth",
+        type=float,
+        default=DEFAULT_MISSED_LOOK_GROWTH,
+        help=f"Extra mask scale for each missed detector look. Default {DEFAULT_MISSED_LOOK_GROWTH}.",
+    )
+    parser.add_argument(
+        "--pii-blur-kernel",
+        type=int,
+        default=DEFAULT_BLUR_KERNEL,
+        help=f"Gaussian kernel size in pixels, odd. Default {DEFAULT_BLUR_KERNEL}. Ignored for none mode.",
+    )
+    parser.add_argument(
+        "--pii-paint-mode",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "none"],
+        help="gaussian blurs the face. none leaves the pixels and keeps a mask archive on the clip.",
+    )
+    parser.add_argument(
+        "--pii-gpus-per-worker",
+        type=float,
+        default=1.0,
+        help="GPUs reserved for the PII redaction stage.",
     )
     # --- Super-resolution args ---
     parser.add_argument(
