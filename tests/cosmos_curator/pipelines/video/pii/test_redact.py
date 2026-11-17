@@ -18,6 +18,7 @@
 Growth and kernel values here are arbitrary test inputs, not recommendations.
 """
 
+import threading
 from fractions import Fraction
 from pathlib import Path
 
@@ -203,6 +204,46 @@ def test_a_decode_window_does_not_change_the_output() -> None:
     windowed = redact_mp4(mp4, _truth_detector(truth), _config(decode_window_frames=7))
 
     assert windowed.mp4_bytes == whole.mp4_bytes
+
+
+def test_the_detector_thread_does_not_change_the_output() -> None:
+    """Looks run ahead on their own thread, and the bytes match running them inline."""
+    mp4, truth = _scene_clip(30)
+    inline_detector = _truth_detector(truth)
+    threaded_detector = _truth_detector(truth)
+
+    inline = redact_mp4(mp4, inline_detector, _config(detector_lookahead_frames=0))
+    threaded = redact_mp4(mp4, threaded_detector, _config(detector_lookahead_frames=10))
+
+    assert threaded.mp4_bytes == inline.mp4_bytes
+    assert threaded_detector.calls == inline_detector.calls == [0, 5, 10, 15, 20, 25, 29]
+
+
+def test_looks_run_off_the_calling_thread_unless_lookahead_is_zero() -> None:
+    """With a lookahead every look runs on the worker. With 0 they run where redact_mp4 was called."""
+    mp4, truth = _scene_clip(20)
+
+    class ThreadRecorder:
+        def __init__(self) -> None:
+            self.threads: set[int] = set()
+
+        def detect(self, frame_rgb: npt.NDArray[np.uint8], frame_index: int) -> list:
+            self.threads.add(threading.get_ident())
+            return _truth_detector(truth).detect(frame_rgb, frame_index)
+
+    ahead, inline = ThreadRecorder(), ThreadRecorder()
+    redact_mp4(mp4, ahead, _config(detector_lookahead_frames=10))  # type: ignore[arg-type]
+    redact_mp4(mp4, inline, _config(detector_lookahead_frames=0))  # type: ignore[arg-type]
+
+    assert inline.threads == {threading.get_ident()}
+    assert len(ahead.threads) == 1
+    assert threading.get_ident() not in ahead.threads
+
+
+def test_a_negative_lookahead_is_refused() -> None:
+    """0 turns the thread off. Below that is a mistake."""
+    with pytest.raises(ValueError, match="detector_lookahead_frames"):
+        _config(detector_lookahead_frames=-1)
 
 
 def test_failed_encode_raises_and_returns_nothing() -> None:

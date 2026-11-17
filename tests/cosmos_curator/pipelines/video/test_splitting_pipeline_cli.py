@@ -117,13 +117,16 @@ def test_pii_redaction_sits_after_transcode_and_before_frame_extraction() -> Non
 
 
 def test_pii_redaction_uses_the_trial_defaults() -> None:
-    """The flag alone uses growth 1.25, missed-look growth 1.5, and kernel 151."""
+    """The flag alone uses growth 1.25, missed-look growth 1.5, kernel 151, blurred at quarter size."""
     stages = [stage_object(stage) for stage in _assemble_stages(_caption_args(["--pii-redaction"]))]
     stage = next(stage for stage in stages if isinstance(stage, PiiRedactionStage))
 
     assert stage._config.mask_growth == 1.25
     assert stage._config.missed_look_growth == 1.5
     assert stage._config.blur_kernel == 151
+    assert stage._config.blur_downscale == 4
+    assert stage._config.paint_mode.value == "gaussian"
+    assert stage._config.pixelate_block == 24
 
 
 def test_pii_redaction_refuses_fixed_stride() -> None:

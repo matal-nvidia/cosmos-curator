@@ -19,6 +19,8 @@ Growth and kernel size are arguments with no defaults, because the plan has not
 chosen them. The tests pass arbitrary values; none of them is a recommendation.
 """
 
+from collections.abc import Callable
+
 import cv2
 import numpy as np
 import pytest
@@ -66,11 +68,38 @@ def test_gaussian_requires_a_kernel_and_has_no_default() -> None:
         PaintConfig(mode=PaintMode.GAUSSIAN, mask_growth=1.0, missed_look_growth=1.0)
 
 
+@pytest.mark.parametrize("mode", [PaintMode.GAUSSIAN, PaintMode.STACK, PaintMode.BOX])
 @pytest.mark.parametrize("kernel", [0, -3, 4, 30])
-def test_kernel_must_be_odd_and_positive(kernel: int) -> None:
-    """Even and non-positive kernels are rejected."""
+def test_kernel_must_be_odd_and_positive(mode: PaintMode, kernel: int) -> None:
+    """Even and non-positive kernels are rejected for every blur that uses one."""
     with pytest.raises(ValueError, match="odd"):
-        PaintConfig(mode=PaintMode.GAUSSIAN, mask_growth=1.0, missed_look_growth=1.0, blur_kernel=kernel)
+        PaintConfig(mode=mode, mask_growth=1.0, missed_look_growth=1.0, blur_kernel=kernel)
+
+
+@pytest.mark.parametrize("mode", [PaintMode.STACK, PaintMode.BOX])
+def test_stack_and_box_require_a_kernel(mode: PaintMode) -> None:
+    """The other kernel blurs are refused the same way gaussian is."""
+    with pytest.raises(ValueError, match="blur_kernel is required"):
+        PaintConfig(mode=mode, mask_growth=1.0, missed_look_growth=1.0)
+
+
+def test_pixelate_requires_a_block() -> None:
+    """Pixelate with no block size is rejected."""
+    with pytest.raises(ValueError, match="pixelate_block"):
+        PaintConfig(mode=PaintMode.PIXELATE, mask_growth=1.0, missed_look_growth=1.0)
+
+
+@pytest.mark.parametrize(("downscale", "kernel"), [(0, 31), (33, 31)])
+def test_downscale_must_be_between_one_and_the_kernel(downscale: int, kernel: int) -> None:
+    """A factor under 1 is meaningless, and one past the kernel leaves nothing to blur with."""
+    with pytest.raises(ValueError, match="blur_downscale"):
+        PaintConfig(
+            mode=PaintMode.GAUSSIAN,
+            mask_growth=1.0,
+            missed_look_growth=1.0,
+            blur_kernel=kernel,
+            blur_downscale=downscale,
+        )
 
 
 def test_none_mode_needs_no_kernel() -> None:
@@ -215,6 +244,98 @@ def test_cropped_blur_equals_blurring_the_whole_frame(mask: np.ndarray) -> None:
     reference[mask] = cv2.GaussianBlur(frame, (_KERNEL, _KERNEL), 0)[mask]
 
     out = paint_frame(frame, mask, _gaussian())
+
+    assert np.array_equal(out, reference)
+
+
+def _downscaled(kernel: int = _KERNEL, downscale: int = 4) -> PaintConfig:
+    return PaintConfig(
+        mode=PaintMode.GAUSSIAN,
+        mask_growth=1.0,
+        missed_look_growth=1.0,
+        blur_kernel=kernel,
+        blur_downscale=downscale,
+    )
+
+
+def test_downscaled_blur_changes_only_pixels_under_the_mask() -> None:
+    """The cheaper blur keeps the same boundary: outside the mask nothing moves."""
+    frame = _frame()
+    before = frame.copy()
+
+    out = paint_frame(frame, FACE, _downscaled())
+
+    assert np.array_equal(frame, before)
+    assert np.array_equal(out[~FACE], before[~FACE])
+
+
+def test_downscaled_blur_removes_the_detail_inside_the_mask() -> None:
+    """Shrinking first must not leave the face readable."""
+    frame = _frame()
+
+    out = paint_frame(frame, FACE, _downscaled())
+
+    assert out[FACE].std() < 0.2 * frame[FACE].std()
+
+
+def test_downscaled_blur_is_close_to_the_exact_one() -> None:
+    """Close, not equal: the average pixel under the mask moves by a few levels at most."""
+    frame = _frame()
+
+    exact = paint_frame(frame, FACE, _gaussian(kernel=151))
+    cheap = paint_frame(frame, FACE, _downscaled(kernel=151, downscale=4))
+
+    assert np.abs(cheap[FACE].astype(np.int16) - exact[FACE].astype(np.int16)).mean() < 3.0
+
+
+def _mode(mode: PaintMode) -> PaintConfig:
+    return PaintConfig(
+        mode=mode,
+        mask_growth=1.0,
+        missed_look_growth=1.0,
+        blur_kernel=_KERNEL,
+        pixelate_block=8,
+    )
+
+
+@pytest.mark.parametrize("mode", [PaintMode.STACK, PaintMode.BOX, PaintMode.PIXELATE, PaintMode.SOLID])
+def test_each_redaction_changes_only_pixels_under_the_mask(mode: PaintMode) -> None:
+    """Every style keeps the same boundary: outside the mask nothing moves."""
+    frame = _frame()
+    before = frame.copy()
+
+    out = paint_frame(frame, FACE, _mode(mode))
+
+    assert np.array_equal(frame, before)
+    assert np.array_equal(out[~FACE], before[~FACE])
+    assert not np.array_equal(out[FACE], before[FACE])
+
+
+def test_solid_paints_the_mask_black() -> None:
+    """Solid fill is black under the mask and nowhere else."""
+    frame = _frame()
+
+    out = paint_frame(frame, FACE, _mode(PaintMode.SOLID))
+
+    assert int(out[FACE].max()) == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "filter_frame"),
+    [
+        (PaintMode.STACK, lambda frame: cv2.stackBlur(frame, (_KERNEL, _KERNEL))),
+        (PaintMode.BOX, lambda frame: cv2.blur(frame, (_KERNEL, _KERNEL))),
+    ],
+)
+def test_cropped_kernel_blur_equals_filtering_the_whole_frame(
+    mode: PaintMode, filter_frame: Callable[[np.ndarray], np.ndarray]
+) -> None:
+    """The padded crop is an optimisation, so stack and box must match a full-frame filter."""
+    frame = _frame()
+    reference = frame.copy()
+    reference[FACE] = filter_frame(frame)[FACE]
+
+    out = paint_frame(frame, FACE, _mode(mode))
 
     assert np.array_equal(out, reference)
 

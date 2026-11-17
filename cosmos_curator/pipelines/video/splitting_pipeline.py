@@ -120,9 +120,11 @@ from cosmos_curator.pipelines.video.filtering.motion.motion_builders import (
     build_motion_filter_stages,
 )
 from cosmos_curator.pipelines.video.pii.builders import (
+    DEFAULT_BLUR_DOWNSCALE,
     DEFAULT_BLUR_KERNEL,
     DEFAULT_MASK_GROWTH,
     DEFAULT_MISSED_LOOK_GROWTH,
+    DEFAULT_PIXELATE_BLOCK,
     PiiRedactionStageConfig,
     build_pii_redaction_stages,
 )
@@ -575,6 +577,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                     mask_growth=args.pii_mask_growth,
                     missed_look_growth=args.pii_missed_look_growth,
                     blur_kernel=args.pii_blur_kernel,
+                    blur_downscale=args.pii_blur_downscale,
+                    pixelate_block=args.pii_pixelate_block,
                     paint_mode=paint_mode,
                     gpus_per_worker=args.pii_gpus_per_worker,
                     verbose=args.verbose,
@@ -1627,10 +1631,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--pii-mask-growth",
         type=float,
         default=DEFAULT_MASK_GROWTH,
-        help=(
-            "Scale applied to a face mask about its centroid. "
-            f"Default {DEFAULT_MASK_GROWTH}. 1.0 means no growth."
-        ),
+        help=(f"Scale applied to a face mask about its centroid. Default {DEFAULT_MASK_GROWTH}. 1.0 means no growth."),
     )
     parser.add_argument(
         "--pii-missed-look-growth",
@@ -1642,14 +1643,36 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--pii-blur-kernel",
         type=int,
         default=DEFAULT_BLUR_KERNEL,
-        help=f"Gaussian kernel size in pixels, odd. Default {DEFAULT_BLUR_KERNEL}. Ignored for none mode.",
+        help=(
+            "Kernel size in pixels, odd, for gaussian, stack and box. "
+            f"Default {DEFAULT_BLUR_KERNEL}. Ignored for pixelate, solid and none."
+        ),
+    )
+    parser.add_argument(
+        "--pii-blur-downscale",
+        type=int,
+        default=DEFAULT_BLUR_DOWNSCALE,
+        help=(
+            "For gaussian, blur the face box at 1/N size and scale it back up. "
+            f"Default {DEFAULT_BLUR_DOWNSCALE}. 1 is the exact Gaussian. Ignored by every other mode."
+        ),
+    )
+    parser.add_argument(
+        "--pii-pixelate-block",
+        type=int,
+        default=DEFAULT_PIXELATE_BLOCK,
+        help=f"Block size in pixels for pixelate mode. Default {DEFAULT_PIXELATE_BLOCK}. Ignored otherwise.",
     )
     parser.add_argument(
         "--pii-paint-mode",
         type=str,
         default="gaussian",
-        choices=["gaussian", "none"],
-        help="gaussian blurs the face. none leaves the pixels and keeps a mask archive on the clip.",
+        choices=["gaussian", "stack", "box", "pixelate", "solid", "none"],
+        help=(
+            "What covers the face. gaussian (the default) blurs at 1/4 size. "
+            "stack and box are other blurs at the same kernel. pixelate uses blocks. "
+            "solid paints black. none leaves the pixels and keeps a mask archive."
+        ),
     )
     parser.add_argument(
         "--pii-gpus-per-worker",

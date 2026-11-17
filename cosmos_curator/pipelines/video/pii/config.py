@@ -118,10 +118,22 @@ class LKConfig:
 
 
 class PaintMode(enum.StrEnum):
-    """What is written into the clip where a face mask is."""
+    """What is written into the clip where a face mask is.
+
+    ``gaussian`` is the one the stage runs. The others are the styles timed on the
+    same face box; each one is selectable, and none of them is a second default.
+    """
 
     GAUSSIAN = "gaussian"
+    STACK = "stack"
+    BOX = "box"
+    PIXELATE = "pixelate"
+    SOLID = "solid"
     NONE = "none"
+
+
+# Modes that filter a neighbourhood, so they need an odd kernel and a padded crop.
+_KERNEL_MODES = frozenset({PaintMode.GAUSSIAN, PaintMode.STACK, PaintMode.BOX})
 
 
 @attrs.define(frozen=True)
@@ -129,16 +141,23 @@ class PaintConfig:
     """How the tracked masks are turned into pixels. No numbers are defaulted.
 
     Attributes:
-        mode: ``gaussian`` blurs under the grown mask and keeps no masks;
-            ``none`` leaves the pixels alone and writes a mask archive.
+        mode: what covers the face. ``gaussian``, ``stack`` and ``box`` blur;
+            ``pixelate`` replaces the face with blocks; ``solid`` paints it
+            black; ``none`` leaves the pixels alone and writes a mask archive.
+            Only ``none`` keeps masks.
         mask_growth: scale applied to a mask about its centroid. ``1.0`` means
             no growth, ``1.1`` means 10% larger (EgoBlur's
             ``--scale_factor_detections`` shape). The grown mask always contains
             the original.
         missed_look_growth: extra scale applied once per consecutive missed look,
             on top of ``mask_growth``, because the position is less certain.
-        blur_kernel: Gaussian kernel size in pixels, odd. Required for
-            ``gaussian`` and ignored for ``none``.
+        blur_kernel: kernel size in pixels, odd. Required for ``gaussian``,
+            ``stack`` and ``box``. Ignored otherwise.
+        blur_downscale: for ``gaussian`` only, blur a copy of the face box shrunk
+            by this factor, with the kernel shrunk to match, then scale it back
+            up. ``1`` is the exact Gaussian. Larger is cheaper and close to it,
+            not equal. Ignored by every other mode.
+        pixelate_block: block size in pixels for ``pixelate``. Ignored otherwise.
 
     """
 
@@ -146,6 +165,8 @@ class PaintConfig:
     mask_growth: float
     missed_look_growth: float
     blur_kernel: int | None = None
+    blur_downscale: int = 1
+    pixelate_block: int | None = None
 
     def __attrs_post_init__(self) -> None:
         """Reject values the painter cannot run with."""
@@ -155,13 +176,25 @@ class PaintConfig:
         if self.missed_look_growth < 1.0:
             msg = f"missed_look_growth must be >= 1.0, got {self.missed_look_growth}"
             raise ValueError(msg)
-        if self.mode is PaintMode.GAUSSIAN:
+        if self.mode in _KERNEL_MODES:
             if self.blur_kernel is None:
-                msg = "blur_kernel is required for gaussian mode and has no default"
+                msg = f"blur_kernel is required for {self.mode.value} mode and has no default"
                 raise ValueError(msg)
             if self.blur_kernel < 1 or self.blur_kernel % 2 == 0:
                 msg = f"blur_kernel must be a positive odd integer, got {self.blur_kernel}"
                 raise ValueError(msg)
+        if self.blur_downscale < 1:
+            msg = f"blur_downscale must be >= 1, got {self.blur_downscale}"
+            raise ValueError(msg)
+        if self.mode is PaintMode.GAUSSIAN and self.blur_kernel is not None and self.blur_downscale > self.blur_kernel:
+            msg = f"blur_downscale ({self.blur_downscale}) must not exceed blur_kernel ({self.blur_kernel})"
+            raise ValueError(msg)
+        if self.mode is PaintMode.PIXELATE and (self.pixelate_block is None or self.pixelate_block < 1):
+            msg = f"pixelate_block must be >= 1 for pixelate mode, got {self.pixelate_block}"
+            raise ValueError(msg)
+        if self.pixelate_block is not None and self.pixelate_block < 1:
+            msg = f"pixelate_block must be >= 1, got {self.pixelate_block}"
+            raise ValueError(msg)
 
 
 @attrs.define(frozen=True)
@@ -197,6 +230,9 @@ class RedactionConfig:
         encode: output encode settings.
         decode_window_frames: decode this many frames at a time to bound memory,
             or ``None`` to decode the clip in one batch.
+        detector_lookahead_frames: run the detector on its own thread, this many
+            frames ahead of the tracker, so a look overlaps the tracking, blur and
+            encode of the frames before it. ``0`` runs it on the calling thread.
 
     """
 
@@ -205,9 +241,13 @@ class RedactionConfig:
     lk: LKConfig = attrs.Factory(LKConfig)
     encode: EncodeConfig = attrs.Factory(EncodeConfig)
     decode_window_frames: int | None = None
+    detector_lookahead_frames: int = 10
 
     def __attrs_post_init__(self) -> None:
-        """Reject a non-positive decode window."""
+        """Reject a non-positive decode window and a negative lookahead."""
         if self.decode_window_frames is not None and self.decode_window_frames < 1:
             msg = f"decode_window_frames must be >= 1, got {self.decode_window_frames}"
+            raise ValueError(msg)
+        if self.detector_lookahead_frames < 0:
+            msg = f"detector_lookahead_frames must be >= 0, got {self.detector_lookahead_frames}"
             raise ValueError(msg)

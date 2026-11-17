@@ -21,7 +21,7 @@ so after this returns. If anything fails, it raises and the caller still holds
 the original, never a half-written clip.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 import attrs
 import numpy as np
@@ -39,6 +39,7 @@ from cosmos_curator.pipelines.video.pii.encode import (
 )
 from cosmos_curator.pipelines.video.pii.mask_archive import MaskArchiveWriter
 from cosmos_curator.pipelines.video.pii.paint import paint_frame, union_mask
+from cosmos_curator.pipelines.video.pii.prefetch import PrefetchingDetector
 from cosmos_curator.pipelines.video.pii.propagate import LKRigidPropagator, MaskPropagator
 from cosmos_curator.pipelines.video.pii.tracker import FrameResult, PiiTracker, TrackerStats
 
@@ -78,6 +79,10 @@ def redact_mp4(
     """
     decoder = FullRateDecoder(mp4_bytes)
     paint = config.paint
+    prefetch: PrefetchingDetector | None = None
+    if config.detector_lookahead_frames > 0:
+        prefetch = PrefetchingDetector(detector, config.tracker.look_interval, config.detector_lookahead_frames)
+        detector = prefetch
     tracker = PiiTracker(detector, config.tracker, propagator or LKRigidPropagator(config.lk))
 
     archive: MaskArchiveWriter | None = None
@@ -101,20 +106,27 @@ def redact_mp4(
                     archive.add(result.index, mask)
                 yield paint_frame(result.frame_rgb, mask, paint)
 
-        for frame in decoder.frames(config.decode_window_frames):
+        frames: Iterable[npt.NDArray[np.uint8]] = decoder.frames(config.decode_window_frames)
+        if prefetch is not None:
+            frames = prefetch.frames(frames)
+        for frame in frames:
             yield from handle(tracker.push(frame))
         yield from handle(tracker.finish())
 
     frame_rate = nominal_frame_rate(decoder.avg_frame_rate, decoder.timestamps_ns)
-    out_bytes = encode_frames(
-        painted(),
-        decoder.timestamps_ns,
-        width=decoder.width,
-        height=decoder.height,
-        frame_rate=frame_rate,
-        bitrate_bps=resolve_bitrate(config.encode, decoder.bit_rate_bps, len(mp4_bytes), frame_rate),
-        config=config.encode,
-    )
+    try:
+        out_bytes = encode_frames(
+            painted(),
+            decoder.timestamps_ns,
+            width=decoder.width,
+            height=decoder.height,
+            frame_rate=frame_rate,
+            bitrate_bps=resolve_bitrate(config.encode, decoder.bit_rate_bps, len(mp4_bytes), frame_rate),
+            config=config.encode,
+        )
+    finally:
+        if prefetch is not None:
+            prefetch.close()
     verify_encoded(out_bytes, decoder.timestamps_ns, width=decoder.width, height=decoder.height)
 
     return RedactionResult(

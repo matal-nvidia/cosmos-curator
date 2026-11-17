@@ -47,6 +47,8 @@ class PiiRedactionStage(CuratorStage):
                 mask_growth=config.mask_growth,
                 missed_look_growth=config.missed_look_growth,
                 blur_kernel=config.blur_kernel,
+                blur_downscale=config.blur_downscale,
+                pixelate_block=config.pixelate_block,
             ),
             encode=EncodeConfig(),
         )
