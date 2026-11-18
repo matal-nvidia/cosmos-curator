@@ -39,8 +39,8 @@ class Detection:
     Attributes:
         mask: full-frame ``(H, W)`` boolean mask.
         score: detector confidence, higher is surer.
-        label: which prompt produced it. The detector config is a list of
-            prompts, so this is carried even though v0 asks only one.
+        label: which prompt produced it. The detector asks the ten production
+            prompts unless the caller passes a different list.
 
     """
 

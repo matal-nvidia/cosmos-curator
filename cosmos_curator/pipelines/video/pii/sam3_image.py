@@ -16,10 +16,10 @@
 """Still-image SAM3 detector for one frame at a time.
 
 This is the MicroAGI shape, not Curator's video SAM3. The image is encoded once
-per frame. Each prompt is a separate question about that encoding, and the
-prompt embeddings are computed once at setup, not once per frame. The model
-does not remember faces from one frame to the next. Following a face across
-frames stays in :class:`~cosmos_curator.pipelines.video.pii.tracker.PiiTracker`.
+per frame. Every prepared prompt is then one batched decoder call about that
+encoding, and the prompt embeddings are computed once at setup, not once per
+frame. The model does not remember faces from one frame to the next. Following
+a face across frames stays in :class:`~cosmos_curator.pipelines.video.pii.tracker.PiiTracker`.
 
 The frame is stretched to a square. It is not padded, so a wide frame is
 squashed and the mask is stretched back afterwards. The square is 1008 px: the
@@ -36,13 +36,28 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 
-from cosmos_curator.pipelines.video.pii.detector import DEFAULT_LABEL, Detection
+from cosmos_curator.pipelines.video.pii.detector import Detection
 
 # The checkpoint's own image_size. MicroAGI's 1120 belongs to SAM3.1 and crashes
-# on facebook/sam3 (rotary embeddings are sized for 1008). A face is kept at a
-# score of at least 0.50. The 500 px minimum stays in the tracker.
+# on facebook/sam3 (rotary embeddings are sized for 1008). The 500 px minimum
+# stays in the tracker.
 INPUT_SIZE = 1008
 SCORE_THRESHOLD = 0.50
+# The ten production prompts and the score each one must clear, from the
+# MicroAGI v1.6.0 guide. Face, head and license plate sit at 0.50. The vaguer
+# prompts sit higher, because "document" can match a wall.
+PRODUCTION_PROMPTS: tuple[tuple[str, float], ...] = (
+    ("human face", 0.50),
+    ("human head", 0.50),
+    ("license plate", 0.50),
+    ("ID card", 0.75),
+    ("passport", 0.75),
+    ("credit card", 0.75),
+    ("handwritten text", 0.65),
+    ("paper document", 0.82),
+    ("address label on package", 0.91),
+    ("screen", 0.80),
+)
 # Where the model's soft mask becomes a hard one. This is the model's own
 # binarization, not the blur and not the 500 px rule.
 MASK_THRESHOLD = 0.5
@@ -118,11 +133,11 @@ class Sam3ImageSegmenter:
     def segment(
         self, square_rgb: npt.NDArray[np.uint8], min_score: float = 0.0
     ) -> list[tuple[npt.NDArray[np.bool_], float, str]]:
-        """Encode ``square_rgb`` once and ask every prepared prompt.
+        """Encode ``square_rgb`` once and ask every prepared prompt in one decoder call.
 
-        Only masks scoring at least ``min_score`` leave the GPU. Each look returns
-        200 candidate masks as ``int64``, so copying all of them costs more than
-        the forward pass.
+        Only masks scoring at least ``min_score`` leave the GPU. The library keeps a
+        mask only when its score is strictly above the threshold it is given, so the
+        call uses a hair under ``min_score`` and the comparison here is "at least".
         """
         import torch  # noqa: PLC0415 -- the package imports without torch installed
 
@@ -137,27 +152,31 @@ class Sam3ImageSegmenter:
             ),
             self._device,
         )
+        count = len(self._prompts)
+        pooled = torch.cat([text.pooler_output for _prompt, text, _mask in self._prompts], dim=0)
+        attention = torch.cat([mask for _prompt, _text, mask in self._prompts], dim=0)
         autocast = torch.autocast(device_type=torch.device(self._device).type, dtype=torch.bfloat16, enabled=self._bf16)
         with torch.inference_mode(), autocast:
             vision = self._model.get_vision_features(pixel_values=image["pixel_values"])
+            outputs = self._model(
+                vision_embeds=_repeat_to_batch(vision, count),
+                text_embeds=_PooledText(pooled),
+                attention_mask=attention,
+            )
+        _outputs_to_fp32(outputs)
+        processed = self._processor.post_process_instance_segmentation(
+            outputs,
+            threshold=max(min_score - 1e-4, 0.0),
+            mask_threshold=MASK_THRESHOLD,
+            target_sizes=[(self._input_size, self._input_size)] * count,
+        )
         found: list[tuple[npt.NDArray[np.bool_], float, str]] = []
-        target = [(self._input_size, self._input_size)]
-        for prompt, text, attention_mask in self._prompts:
-            with torch.inference_mode(), autocast:
-                outputs = self._model(vision_embeds=vision, text_embeds=text, attention_mask=attention_mask)
-            _outputs_to_fp32(outputs)
-            # threshold 0: the library keeps scores *strictly above* its threshold,
-            # and the plan says at least 0.50. ``min_score`` applies that comparison.
-            result = self._processor.post_process_instance_segmentation(
-                outputs,
-                threshold=0.0,
-                mask_threshold=MASK_THRESHOLD,
-                target_sizes=target,
-            )[0]
+        for prompt_i, result in enumerate(processed):
+            label = self._prompts[prompt_i][0]
             for mask, score in zip(result["masks"], result["scores"], strict=True):
                 value = float(score)
                 if value >= min_score:
-                    found.append((_as_mask(mask), value, prompt))
+                    found.append((_as_mask(mask), value, label))
         return found
 
 
@@ -176,18 +195,26 @@ class Sam3ImageDetector:
         score_threshold: float = SCORE_THRESHOLD,
         segmenter: _Segmenter | None = None,
     ) -> None:
-        """Store the prompts. Nothing is loaded until :meth:`setup`."""
+        """Store the prompts. Nothing is loaded until :meth:`setup`.
+
+        With no prompt list, the ten production prompts are used and each keeps
+        the score published for it. A caller-supplied list uses ``score_threshold``
+        for every prompt.
+        """
         if prompts is None:
-            prompts = [DEFAULT_LABEL]
-        if not prompts:
-            msg = "Sam3ImageDetector requires at least one prompt"
-            raise ValueError(msg)
+            self._prompt_floors = list(PRODUCTION_PROMPTS)
+        else:
+            if not prompts:
+                msg = "Sam3ImageDetector requires at least one prompt"
+                raise ValueError(msg)
+            self._prompt_floors = [(prompt, score_threshold) for prompt in prompts]
         if input_size < 1:
             msg = f"input_size must be >= 1, got {input_size}"
             raise ValueError(msg)
-        self._prompts = list(prompts)
+        self._prompts = [prompt for prompt, _floor in self._prompt_floors]
+        self._floors = dict(self._prompt_floors)
         self._input_size = input_size
-        self._score_threshold = score_threshold
+        self._score_threshold = min(self._floors.values())
         self._segmenter = segmenter
         self._ready = False
 
@@ -212,7 +239,7 @@ class Sam3ImageDetector:
         square = stretch_to_square(frame_rgb, self._input_size)
         detections: list[Detection] = []
         for mask, score, label in self._segmenter.segment(square, self._score_threshold):
-            if score < self._score_threshold:
+            if score < self._floors[label]:
                 continue
             full = mask_to_frame(mask, height, width)
             if not full.any():
@@ -249,6 +276,35 @@ def load_sam3_image_segmenter(input_size: int = INPUT_SIZE, model_dir: Path | No
     model = cast("Any", Sam3Model.from_pretrained(model_dir, local_files_only=True)).to("cuda")
     model.eval()
     return Sam3ImageSegmenter(model, processor, input_size)
+
+
+class _PooledText:
+    """The text object the decoder reads. Only ``pooler_output`` is used."""
+
+    def __init__(self, pooler_output: Any) -> None:  # noqa: ANN401
+        self.pooler_output = pooler_output
+
+
+def _repeat_to_batch(vision: Any, count: int) -> Any:  # noqa: ANN401
+    """Repeat a batch-1 vision encoding so one decoder call can hold ``count`` prompts."""
+    if count == 1:
+        return vision
+    import torch  # noqa: PLC0415 -- the package imports without torch installed
+
+    if torch.is_tensor(vision):
+        return vision.repeat((count,) + (1,) * (vision.ndim - 1))
+    cloned = type(vision)(**dict(vision.items()))
+    for key, value in list(cloned.items()):
+        if torch.is_tensor(value) and value.shape[:1] == (1,):
+            cloned[key] = value.repeat((count,) + (1,) * (value.ndim - 1))
+        elif isinstance(value, tuple) and value and torch.is_tensor(value[0]):
+            cloned[key] = tuple(
+                item.repeat((count,) + (1,) * (item.ndim - 1))
+                if torch.is_tensor(item) and item.shape[:1] == (1,)
+                else item
+                for item in value
+            )
+    return cloned
 
 
 def _outputs_to_fp32(outputs: Any) -> None:  # noqa: ANN401
